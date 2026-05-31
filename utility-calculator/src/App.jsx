@@ -180,6 +180,8 @@ const emptyBill = () => ({
   electricityTotal: "",
   waterTotal: "",
   sharedOtherFee: 0,
+  subsidyBaseTotal: "",
+  subsidyPayableTotal: "",
   rooms: [newRoom("Room A"), newRoom("Room B"), newRoom("Room C")],
 });
 
@@ -190,6 +192,8 @@ const exampleBill = () => ({
   electricityTotal: 159.41,
   waterTotal: 25.4,
   sharedOtherFee: 0,
+  subsidyBaseTotal: "",
+  subsidyPayableTotal: "",
   rooms: [
     {
       id: uid(),
@@ -231,6 +235,8 @@ function normalizeBill(raw) {
     electricityTotal: raw.electricityTotal ?? "",
     waterTotal: raw.waterTotal ?? "",
     sharedOtherFee: raw.sharedOtherFee ?? 0,
+    subsidyBaseTotal: raw.subsidyBaseTotal ?? "",
+    subsidyPayableTotal: raw.subsidyPayableTotal ?? "",
     rooms: (raw.rooms || []).map((room) => ({
       id: room.id || uid(),
       name: room.name || "Room",
@@ -320,14 +326,14 @@ function calculateBill(bill) {
   const waterRate = totalPersonDays > 0 ? Number(bill.waterTotal || 0) / totalPersonDays : 0;
   const sharedFeePerRoom = rooms.length > 0 ? Number(bill.sharedOtherFee || 0) / rooms.length : 0;
 
-  const roomResults = rooms.map((room) => {
+  const rawRoomResults = rooms.map((room) => {
     const roomUse = roomUseRows.find((row) => row.roomId === room.id);
     const roomPeople = peopleRows.filter((p) => p.roomId === room.id);
     const electricityDays = roomUse?.electricityDays || 0;
     const electricity = electricityDays * electricityRate;
     const water = roomPeople.reduce((sum, p) => sum + p.days * waterRate, 0);
     const gasAdjustment = Number(room.gasAdjustment || 0);
-    const total = electricity + water + sharedFeePerRoom + gasAdjustment;
+    const rawTotal = electricity + water + sharedFeePerRoom + gasAdjustment;
     return {
       ...room,
       electricityDays,
@@ -335,12 +341,38 @@ function calculateBill(bill) {
       water,
       sharedFee: sharedFeePerRoom,
       gasAdjustment,
-      total,
+      rawTotal,
       people: roomPeople.map((p) => ({ ...p, waterCost: p.days * waterRate })),
     };
   });
 
-  return { totalRoomDays, electricityRate, totalPersonDays, waterRate, roomResults };
+  const rawBillTotal = rawRoomResults.reduce((sum, room) => sum + room.rawTotal, 0);
+  const subsidyPayableTotal = Number(bill.subsidyPayableTotal || 0);
+  const manualSubsidyBaseTotal = Number(bill.subsidyBaseTotal || 0);
+  const subsidyBaseTotal = manualSubsidyBaseTotal > 0 ? manualSubsidyBaseTotal : rawBillTotal;
+  const subsidyApplied = subsidyPayableTotal > 0 && subsidyBaseTotal > 0;
+  const subsidyRatio = subsidyApplied ? subsidyPayableTotal / subsidyBaseTotal : 1;
+
+  const roomResults = rawRoomResults.map((room) => ({
+    ...room,
+    subsidyCredit: room.rawTotal - room.rawTotal * subsidyRatio,
+    total: room.rawTotal * subsidyRatio,
+  }));
+  const finalBillTotal = roomResults.reduce((sum, room) => sum + room.total, 0);
+
+  return {
+    totalRoomDays,
+    electricityRate,
+    totalPersonDays,
+    waterRate,
+    rawBillTotal,
+    finalBillTotal,
+    subsidyApplied,
+    subsidyBaseTotal,
+    subsidyPayableTotal,
+    subsidyRatio,
+    roomResults,
+  };
 }
 
 export default function App() {
@@ -404,6 +436,8 @@ export default function App() {
       electricityTotal: Number(bill.electricityTotal || 0),
       waterTotal: Number(bill.waterTotal || 0),
       sharedOtherFee: Number(bill.sharedOtherFee || 0),
+      subsidyBaseTotal: bill.subsidyBaseTotal === "" ? "" : Number(bill.subsidyBaseTotal || 0),
+      subsidyPayableTotal: bill.subsidyPayableTotal === "" ? "" : Number(bill.subsidyPayableTotal || 0),
       updatedAt: serverTimestamp(),
     };
   }
@@ -591,10 +625,15 @@ export default function App() {
       `Period: ${bill.startDate || "?"} to ${bill.endDate || "?"}`,
       `Electricity: ${currency(Number(bill.electricityTotal || 0))} / ${calculation.totalRoomDays} occupied room-days = ${currency(calculation.electricityRate)} per room-day`,
       `Water: ${currency(Number(bill.waterTotal || 0))} / ${calculation.totalPersonDays} person-days = ${currency(calculation.waterRate)} per person-day`,
+      ...(calculation.subsidyApplied
+        ? [
+            `Subsidy ratio: ${currency(calculation.subsidyPayableTotal)} / ${currency(calculation.subsidyBaseTotal)} = ${(calculation.subsidyRatio * 100).toFixed(2)}%`,
+          ]
+        : []),
       "",
       ...calculation.roomResults.map(
         (r) =>
-          `${r.name}: ${currency(r.total)}  electricity ${currency(r.electricity)} + water ${currency(r.water)} + gas/adjustment ${currency(r.gasAdjustment)}`
+          `${r.name}: ${currency(r.total)} due${calculation.subsidyApplied ? ` from ${currency(r.rawTotal)} before subsidy` : ""}  electricity ${currency(r.electricity)} + water ${currency(r.water)} + gas/adjustment ${currency(r.gasAdjustment)}`
       ),
     ];
     await navigator.clipboard.writeText(lines.join("\n"));
@@ -648,6 +687,8 @@ export default function App() {
                 <label>End date<input type="date" value={bill.endDate || ""} onChange={(e) => updateBillPeriod("endDate", e.target.value)} /></label>
                 <label>Total electricity<input type="number" value={bill.electricityTotal ?? ""} onChange={(e) => updateBill("electricityTotal", e.target.value)} /></label>
                 <label>Total water<input type="number" value={bill.waterTotal ?? ""} onChange={(e) => updateBill("waterTotal", e.target.value)} /></label>
+                <label>Original total before subsidy, optional<input type="number" value={bill.subsidyBaseTotal ?? ""} onChange={(e) => updateBill("subsidyBaseTotal", e.target.value)} /></label>
+                <label>Actual amount to split after subsidy, optional<input type="number" value={bill.subsidyPayableTotal ?? ""} onChange={(e) => updateBill("subsidyPayableTotal", e.target.value)} /></label>
               </div>
             </div>
             <div className="card metric">
@@ -660,6 +701,13 @@ export default function App() {
               <strong>{currency(calculation.waterRate)}</strong>
               <span>per person-day × {calculation.totalPersonDays}</span>
             </div>
+            {calculation.subsidyApplied && (
+              <div className="card metric">
+                <h2>Subsidy</h2>
+                <strong>{(calculation.subsidyRatio * 100).toFixed(1)}%</strong>
+                <span>{currency(calculation.subsidyPayableTotal)} / {currency(calculation.subsidyBaseTotal)}</span>
+              </div>
+            )}
           </section>
 
           <section className="rooms">
@@ -670,7 +718,7 @@ export default function App() {
                   <button className="icon" onClick={() => removeRoom(room.id)}><Trash2 size={16} /></button>
                 </div>
 
-                <label>Room-specific gas / adjustment
+                <label>Room extra charge / credit
                   <input type="number" value={room.gasAdjustment ?? 0} onChange={(e) => updateRoom(room.id, "gasAdjustment", e.target.value)} />
                 </label>
 
@@ -729,7 +777,7 @@ export default function App() {
               <table>
                 <thead>
                   <tr>
-                    <th>Room</th><th>Electricity days</th><th>Electricity</th><th>Water</th><th>Shared fee</th><th>Gas / adjustment</th><th>Total</th><th>Person-day detail</th>
+                    <th>Room</th><th>Electricity days</th><th>Electricity</th><th>Water</th><th>Shared fee</th><th>Extra / credit</th><th>Before subsidy</th><th>Total due</th><th>Person-day detail</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -741,6 +789,7 @@ export default function App() {
                       <td>{currency(room.water)}</td>
                       <td>{currency(room.sharedFee)}</td>
                       <td>{currency(room.gasAdjustment)}</td>
+                      <td>{currency(room.rawTotal)}</td>
                       <td><strong>{currency(room.total)}</strong></td>
                       <td>
                         {room.people.map((p) => (
@@ -757,7 +806,7 @@ export default function App() {
             </div>
             <p className="note">
               Dates are counted inclusively. For example, 4/5–4/29 = 25 days.
-              Electricity = total electricity ÷ occupied room-days. A room-day counts once if at least one person is present in that room after away dates are subtracted. Water = total water ÷ person-days after away dates are subtracted.
+              Electricity = total electricity ÷ occupied room-days. A room-day counts once if at least one person is present in that room after away dates are subtracted. Water = total water ÷ person-days after away dates are subtracted. If subsidy is entered, total due = before-subsidy total × actual amount to split ÷ original total before subsidy.
             </p>
           </section>
         </section>
