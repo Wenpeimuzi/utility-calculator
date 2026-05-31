@@ -34,12 +34,105 @@ function dateToMs(value) {
   return Number.isNaN(date.getTime()) ? null : date.getTime();
 }
 
-function daysBetweenInclusive(start, end) {
-  if (!start || !end) return 0;
+function dateInterval(start, end) {
   const s = dateToMs(start);
   const e = dateToMs(end);
-  if (s === null || e === null || e < s) return 0;
-  return Math.round((e - s) / DAY_MS) + 1;
+  if (s === null || e === null || e < s) return null;
+  return { start: s, end: e };
+}
+
+function clampInterval(interval, bounds) {
+  if (!interval) return null;
+  if (!bounds) return interval;
+  const clipped = {
+    start: Math.max(interval.start, bounds.start),
+    end: Math.min(interval.end, bounds.end),
+  };
+  return clipped.end >= clipped.start ? clipped : null;
+}
+
+function intervalDays(interval) {
+  return Math.round((interval.end - interval.start) / DAY_MS) + 1;
+}
+
+function mergeIntervals(intervals) {
+  const sorted = intervals
+    .filter(Boolean)
+    .sort((a, b) => a.start - b.start);
+  const merged = [];
+
+  sorted.forEach((interval) => {
+    const last = merged[merged.length - 1];
+    if (!last || interval.start > last.end + DAY_MS) {
+      merged.push({ ...interval });
+    } else {
+      last.end = Math.max(last.end, interval.end);
+    }
+  });
+
+  return merged;
+}
+
+function daysInIntervals(intervals) {
+  return mergeIntervals(intervals).reduce((sum, interval) => sum + intervalDays(interval), 0);
+}
+
+function subtractIntervals(baseIntervals, removalIntervals) {
+  const removals = mergeIntervals(removalIntervals);
+  return mergeIntervals(baseIntervals).flatMap((base) => {
+    let pieces = [base];
+
+    removals.forEach((removal) => {
+      pieces = pieces.flatMap((piece) => {
+        if (removal.end < piece.start || removal.start > piece.end) return [piece];
+
+        const next = [];
+        if (removal.start > piece.start) {
+          next.push({ start: piece.start, end: removal.start - DAY_MS });
+        }
+        if (removal.end < piece.end) {
+          next.push({ start: removal.end + DAY_MS, end: piece.end });
+        }
+        return next;
+      });
+    });
+
+    return pieces.filter((piece) => piece.end >= piece.start);
+  });
+}
+
+function intersectIntervals(leftIntervals, rightIntervals) {
+  const result = [];
+  mergeIntervals(leftIntervals).forEach((left) => {
+    mergeIntervals(rightIntervals).forEach((right) => {
+      const interval = {
+        start: Math.max(left.start, right.start),
+        end: Math.min(left.end, right.end),
+      };
+      if (interval.end >= interval.start) result.push(interval);
+    });
+  });
+  return mergeIntervals(result);
+}
+
+function personPresence(person, billPeriod) {
+  const occupied = clampInterval(dateInterval(person.start, person.end), billPeriod);
+  const occupiedIntervals = occupied ? [occupied] : [];
+  const absenceIntervals = occupied
+    ? (person.absences || [])
+        .map((absence) => clampInterval(dateInterval(absence.start, absence.end), occupied))
+        .filter(Boolean)
+    : [];
+  const presentIntervals = subtractIntervals(occupiedIntervals, absenceIntervals);
+  const occupiedDays = daysInIntervals(occupiedIntervals);
+  const days = daysInIntervals(presentIntervals);
+
+  return {
+    occupiedDays,
+    absentDays: Math.max(0, occupiedDays - days),
+    days,
+    presentIntervals,
+  };
 }
 
 function formatTitleDate(value) {
@@ -52,37 +145,6 @@ function titleFromDates(start, end) {
   if (start) return `${formatTitleDate(start)}-?`;
   if (end) return `?-${formatTitleDate(end)}`;
   return "New monthly bill";
-}
-
-function absenceDaysWithin(person) {
-  const personStart = dateToMs(person.start);
-  const personEnd = dateToMs(person.end);
-  if (personStart === null || personEnd === null || personEnd < personStart) return 0;
-
-  const intervals = (person.absences || [])
-    .map((absence) => {
-      const start = dateToMs(absence.start);
-      const end = dateToMs(absence.end);
-      if (start === null || end === null || end < start) return null;
-      return {
-        start: Math.max(start, personStart),
-        end: Math.min(end, personEnd),
-      };
-    })
-    .filter((interval) => interval && interval.end >= interval.start)
-    .sort((a, b) => a.start - b.start);
-
-  const merged = [];
-  intervals.forEach((interval) => {
-    const last = merged[merged.length - 1];
-    if (!last || interval.start > last.end + DAY_MS) {
-      merged.push({ ...interval });
-    } else {
-      last.end = Math.max(last.end, interval.end);
-    }
-  });
-
-  return merged.reduce((sum, interval) => sum + Math.round((interval.end - interval.start) / DAY_MS) + 1, 0);
 }
 
 function currency(n) {
@@ -219,38 +281,49 @@ function syncRoomsToBillPeriod(rooms, previousStart, previousEnd, nextStart, nex
 
 function calculateBill(bill) {
   const rooms = bill.rooms || [];
-  const roomPeriodRows = rooms.flatMap((room) =>
-    (room.electricityPeriods || []).map((period) => ({
-      ...period,
-      roomId: room.id,
-      days: daysBetweenInclusive(period.start, period.end),
-    }))
-  );
-  const totalRoomDays = roomPeriodRows.reduce((sum, r) => sum + r.days, 0);
-  const electricityRate =
-    totalRoomDays > 0 ? Number(bill.electricityTotal || 0) / totalRoomDays : 0;
+  const billPeriod = dateInterval(bill.startDate, bill.endDate);
 
   const peopleRows = rooms.flatMap((room) =>
     (room.people || []).map((person) => {
-      const occupiedDays = daysBetweenInclusive(person.start, person.end);
-      const absentDays = absenceDaysWithin(person);
+      const presence = personPresence(person, billPeriod);
       return {
         ...person,
         roomId: room.id,
-        occupiedDays,
-        absentDays,
-        days: Math.max(0, occupiedDays - absentDays),
+        ...presence,
       };
     })
   );
+
+  const roomUseRows = rooms.map((room) => {
+    const roomPeople = peopleRows.filter((p) => p.roomId === room.id);
+    const occupiedRoomIntervals = mergeIntervals(roomPeople.flatMap((person) => person.presentIntervals));
+    const electricityPeriodIntervals = mergeIntervals(
+      (room.electricityPeriods || [])
+        .map((period) => clampInterval(dateInterval(period.start, period.end), billPeriod))
+        .filter(Boolean)
+    );
+    const electricityIntervals =
+      electricityPeriodIntervals.length > 0
+        ? intersectIntervals(occupiedRoomIntervals, electricityPeriodIntervals)
+        : occupiedRoomIntervals;
+
+    return {
+      roomId: room.id,
+      electricityDays: daysInIntervals(electricityIntervals),
+    };
+  });
+
+  const totalRoomDays = roomUseRows.reduce((sum, row) => sum + row.electricityDays, 0);
+  const electricityRate =
+    totalRoomDays > 0 ? Number(bill.electricityTotal || 0) / totalRoomDays : 0;
   const totalPersonDays = peopleRows.reduce((sum, p) => sum + p.days, 0);
   const waterRate = totalPersonDays > 0 ? Number(bill.waterTotal || 0) / totalPersonDays : 0;
   const sharedFeePerRoom = rooms.length > 0 ? Number(bill.sharedOtherFee || 0) / rooms.length : 0;
 
   const roomResults = rooms.map((room) => {
-    const roomPeriods = roomPeriodRows.filter((r) => r.roomId === room.id);
+    const roomUse = roomUseRows.find((row) => row.roomId === room.id);
     const roomPeople = peopleRows.filter((p) => p.roomId === room.id);
-    const electricityDays = roomPeriods.reduce((sum, r) => sum + r.days, 0);
+    const electricityDays = roomUse?.electricityDays || 0;
     const electricity = electricityDays * electricityRate;
     const water = roomPeople.reduce((sum, p) => sum + p.days * waterRate, 0);
     const gasAdjustment = Number(room.gasAdjustment || 0);
@@ -501,7 +574,7 @@ export default function App() {
     const lines = [
       `${billTitle}`,
       `Period: ${bill.startDate || "?"} to ${bill.endDate || "?"}`,
-      `Electricity: ${currency(Number(bill.electricityTotal || 0))} / ${calculation.totalRoomDays} room-days = ${currency(calculation.electricityRate)} per room-day`,
+      `Electricity: ${currency(Number(bill.electricityTotal || 0))} / ${calculation.totalRoomDays} occupied room-days = ${currency(calculation.electricityRate)} per room-day`,
       `Water: ${currency(Number(bill.waterTotal || 0))} / ${calculation.totalPersonDays} person-days = ${currency(calculation.waterRate)} per person-day`,
       "",
       ...calculation.roomResults.map(
@@ -564,7 +637,7 @@ export default function App() {
             <div className="card metric">
               <h2>Electricity</h2>
               <strong>{currency(calculation.electricityRate)}</strong>
-              <span>per room-day × {calculation.totalRoomDays}</span>
+              <span>per occupied room-day × {calculation.totalRoomDays}</span>
             </div>
             <div className="card metric">
               <h2>Water</h2>
@@ -640,7 +713,7 @@ export default function App() {
               <table>
                 <thead>
                   <tr>
-                    <th>Room</th><th>Electricity days</th><th>Electricity</th><th>Water</th><th>Shared fee</th><th>Gas / adjustment</th><th>Total</th><th>Water detail</th>
+                    <th>Room</th><th>Electricity days</th><th>Electricity</th><th>Water</th><th>Shared fee</th><th>Gas / adjustment</th><th>Total</th><th>Person-day detail</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -668,7 +741,7 @@ export default function App() {
             </div>
             <p className="note">
               Dates are counted inclusively. For example, 4/5–4/29 = 25 days.
-              Electricity = total electricity ÷ room-use days. Water = total water ÷ person-days after away dates are subtracted.
+              Electricity = total electricity ÷ occupied room-days. A room-day counts once if at least one person is present in that room after away dates are subtracted. Water = total water ÷ person-days after away dates are subtracted.
             </p>
           </section>
         </section>
