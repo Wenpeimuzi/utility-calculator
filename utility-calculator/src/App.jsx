@@ -151,7 +151,8 @@ function currency(n) {
   return new Intl.NumberFormat("en-SG", {
     style: "currency",
     currency: "SGD",
-    minimumFractionDigits: 2,
+    minimumFractionDigits: 4,
+    maximumFractionDigits: 4,
   }).format(Number.isFinite(n) ? n : 0);
 }
 
