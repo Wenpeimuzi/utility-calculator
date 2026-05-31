@@ -24,15 +24,65 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 const HOUSEHOLD_ID = "wenpei-flat";
+const DAY_MS = 86400000;
 
 const uid = () => crypto.randomUUID();
 
+function dateToMs(value) {
+  if (!value) return null;
+  const date = new Date(value + "T00:00:00");
+  return Number.isNaN(date.getTime()) ? null : date.getTime();
+}
+
 function daysBetweenInclusive(start, end) {
   if (!start || !end) return 0;
-  const s = new Date(start + "T00:00:00");
-  const e = new Date(end + "T00:00:00");
-  if (Number.isNaN(s.getTime()) || Number.isNaN(e.getTime()) || e < s) return 0;
-  return Math.round((e - s) / 86400000) + 1;
+  const s = dateToMs(start);
+  const e = dateToMs(end);
+  if (s === null || e === null || e < s) return 0;
+  return Math.round((e - s) / DAY_MS) + 1;
+}
+
+function formatTitleDate(value) {
+  const [year, month, day] = (value || "").split("-");
+  return year && month && day ? `${year}/${month}/${day}` : "";
+}
+
+function titleFromDates(start, end) {
+  if (start && end) return `${formatTitleDate(start)}-${formatTitleDate(end)}`;
+  if (start) return `${formatTitleDate(start)}-?`;
+  if (end) return `?-${formatTitleDate(end)}`;
+  return "New monthly bill";
+}
+
+function absenceDaysWithin(person) {
+  const personStart = dateToMs(person.start);
+  const personEnd = dateToMs(person.end);
+  if (personStart === null || personEnd === null || personEnd < personStart) return 0;
+
+  const intervals = (person.absences || [])
+    .map((absence) => {
+      const start = dateToMs(absence.start);
+      const end = dateToMs(absence.end);
+      if (start === null || end === null || end < start) return null;
+      return {
+        start: Math.max(start, personStart),
+        end: Math.min(end, personEnd),
+      };
+    })
+    .filter((interval) => interval && interval.end >= interval.start)
+    .sort((a, b) => a.start - b.start);
+
+  const merged = [];
+  intervals.forEach((interval) => {
+    const last = merged[merged.length - 1];
+    if (!last || interval.start > last.end + DAY_MS) {
+      merged.push({ ...interval });
+    } else {
+      last.end = Math.max(last.end, interval.end);
+    }
+  });
+
+  return merged.reduce((sum, interval) => sum + Math.round((interval.end - interval.start) / DAY_MS) + 1, 0);
 }
 
 function currency(n) {
@@ -43,15 +93,22 @@ function currency(n) {
   }).format(Number.isFinite(n) ? n : 0);
 }
 
-const newPerson = (name = "New person") => ({ id: uid(), name, start: "", end: "" });
-const newPeriod = () => ({ id: uid(), start: "", end: "" });
+const newAbsence = () => ({ id: uid(), start: "", end: "" });
+const newPerson = (name = "New person", start = "", end = "") => ({
+  id: uid(),
+  name,
+  start,
+  end,
+  absences: [],
+});
+const newPeriod = (start = "", end = "") => ({ id: uid(), start, end });
 
-const newRoom = (name = "Room") => ({
+const newRoom = (name = "Room", start = "", end = "") => ({
   id: uid(),
   name,
   gasAdjustment: 0,
-  electricityPeriods: [newPeriod()],
-  people: [newPerson("Tenant")],
+  electricityPeriods: [newPeriod(start, end)],
+  people: [newPerson("Tenant", start, end)],
 });
 
 const emptyBill = () => ({
@@ -78,8 +135,8 @@ const exampleBill = () => ({
       gasAdjustment: 0,
       electricityPeriods: [{ id: uid(), start: "2026-04-05", end: "2026-04-30" }],
       people: [
-        { id: uid(), name: "我", start: "2026-04-05", end: "2026-04-29" },
-        { id: uid(), name: "朋友", start: "2026-04-22", end: "2026-04-30" },
+        { id: uid(), name: "我", start: "2026-04-05", end: "2026-04-29", absences: [] },
+        { id: uid(), name: "朋友", start: "2026-04-22", end: "2026-04-30", absences: [] },
       ],
     },
     {
@@ -87,7 +144,7 @@ const exampleBill = () => ({
       name: "另一个房间",
       gasAdjustment: 0,
       electricityPeriods: [{ id: uid(), start: "2026-04-05", end: "2026-05-02" }],
-      people: [{ id: uid(), name: "住户", start: "2026-04-05", end: "2026-05-02" }],
+      people: [{ id: uid(), name: "住户", start: "2026-04-05", end: "2026-05-02", absences: [] }],
     },
     {
       id: uid(),
@@ -95,12 +152,70 @@ const exampleBill = () => ({
       gasAdjustment: -3.56,
       electricityPeriods: [{ id: uid(), start: "2026-04-05", end: "2026-05-02" }],
       people: [
-        { id: uid(), name: "肖姐", start: "2026-04-05", end: "2026-05-02" },
-        { id: uid(), name: "4/17-4/25 第二人", start: "2026-04-17", end: "2026-04-25" },
+        { id: uid(), name: "肖姐", start: "2026-04-05", end: "2026-05-02", absences: [] },
+        { id: uid(), name: "4/17-4/25 第二人", start: "2026-04-17", end: "2026-04-25", absences: [] },
       ],
     },
   ],
 });
+
+function normalizeBill(raw) {
+  const startDate = raw.startDate || "";
+  const endDate = raw.endDate || "";
+  return {
+    title: raw.title || titleFromDates(startDate, endDate),
+    startDate,
+    endDate,
+    electricityTotal: raw.electricityTotal ?? "",
+    waterTotal: raw.waterTotal ?? "",
+    sharedOtherFee: raw.sharedOtherFee ?? 0,
+    rooms: (raw.rooms || []).map((room) => ({
+      id: room.id || uid(),
+      name: room.name || "Room",
+      gasAdjustment: room.gasAdjustment ?? 0,
+      electricityPeriods: ((room.electricityPeriods || []).length
+        ? room.electricityPeriods
+        : [newPeriod(startDate, endDate)]
+      ).map((period) => ({
+        id: period.id || uid(),
+        start: period.start || "",
+        end: period.end || "",
+      })),
+      people: ((room.people || []).length ? room.people : [newPerson("Tenant", startDate, endDate)]).map(
+        (person) => ({
+          id: person.id || uid(),
+          name: person.name || "New person",
+          start: person.start || "",
+          end: person.end || "",
+          absences: (person.absences || []).map((absence) => ({
+            id: absence.id || uid(),
+            start: absence.start || "",
+            end: absence.end || "",
+          })),
+        })
+      ),
+    })),
+  };
+}
+
+function syncRoomsToBillPeriod(rooms, previousStart, previousEnd, nextStart, nextEnd) {
+  return (rooms || []).map((room) => ({
+    ...room,
+    electricityPeriods: [
+      {
+        id: room.electricityPeriods?.[0]?.id || uid(),
+        start: nextStart || "",
+        end: nextEnd || "",
+      },
+    ],
+    people: (room.people || []).map((person) => ({
+      ...person,
+      start: !person.start || person.start === previousStart ? nextStart || "" : person.start,
+      end: !person.end || person.end === previousEnd ? nextEnd || "" : person.end,
+      absences: person.absences || [],
+    })),
+  }));
+}
 
 function calculateBill(bill) {
   const rooms = bill.rooms || [];
@@ -116,11 +231,17 @@ function calculateBill(bill) {
     totalRoomDays > 0 ? Number(bill.electricityTotal || 0) / totalRoomDays : 0;
 
   const peopleRows = rooms.flatMap((room) =>
-    (room.people || []).map((person) => ({
-      ...person,
-      roomId: room.id,
-      days: daysBetweenInclusive(person.start, person.end),
-    }))
+    (room.people || []).map((person) => {
+      const occupiedDays = daysBetweenInclusive(person.start, person.end);
+      const absentDays = absenceDaysWithin(person);
+      return {
+        ...person,
+        roomId: room.id,
+        occupiedDays,
+        absentDays,
+        days: Math.max(0, occupiedDays - absentDays),
+      };
+    })
   );
   const totalPersonDays = peopleRows.reduce((sum, p) => sum + p.days, 0);
   const waterRate = totalPersonDays > 0 ? Number(bill.waterTotal || 0) / totalPersonDays : 0;
@@ -173,27 +294,38 @@ export default function App() {
   }, [selectedBillId]);
 
   const calculation = useMemo(() => calculateBill(bill), [bill]);
+  const billTitle = titleFromDates(bill.startDate, bill.endDate);
 
   function updateBill(field, value) {
     setBill((prev) => ({ ...prev, [field]: value }));
   }
 
+  function updateBillPeriod(field, value) {
+    setBill((prev) => {
+      const next = { ...prev, [field]: value };
+      return {
+        ...next,
+        title: titleFromDates(next.startDate, next.endDate),
+        rooms: syncRoomsToBillPeriod(
+          prev.rooms,
+          prev.startDate,
+          prev.endDate,
+          next.startDate,
+          next.endDate
+        ),
+      };
+    });
+  }
+
   function loadBill(b) {
     setSelectedBillId(b.id);
-    setBill({
-      title: b.title || "Monthly bill",
-      startDate: b.startDate || "",
-      endDate: b.endDate || "",
-      electricityTotal: b.electricityTotal ?? "",
-      waterTotal: b.waterTotal ?? "",
-      sharedOtherFee: b.sharedOtherFee ?? 0,
-      rooms: b.rooms || [],
-    });
+    setBill(normalizeBill(b));
   }
 
   async function saveBill() {
     const data = {
       ...bill,
+      title: billTitle,
       electricityTotal: Number(bill.electricityTotal || 0),
       waterTotal: Number(bill.waterTotal || 0),
       sharedOtherFee: Number(bill.sharedOtherFee || 0),
@@ -222,7 +354,10 @@ export default function App() {
   }
 
   function addRoom() {
-    updateBill("rooms", [...(bill.rooms || []), newRoom(`Room ${(bill.rooms || []).length + 1}`)]);
+    updateBill("rooms", [
+      ...(bill.rooms || []),
+      newRoom(`Room ${(bill.rooms || []).length + 1}`, bill.startDate, bill.endDate),
+    ]);
   }
 
   function updateRoom(roomId, field, value) {
@@ -240,7 +375,9 @@ export default function App() {
     updateBill(
       "rooms",
       bill.rooms.map((r) =>
-        r.id === roomId ? { ...r, people: [...(r.people || []), newPerson()] } : r
+        r.id === roomId
+          ? { ...r, people: [...(r.people || []), newPerson("New person", bill.startDate, bill.endDate)] }
+          : r
       )
     );
   }
@@ -265,11 +402,70 @@ export default function App() {
     );
   }
 
+  function addAbsence(roomId, personId) {
+    updateBill(
+      "rooms",
+      bill.rooms.map((r) =>
+        r.id === roomId
+          ? {
+              ...r,
+              people: r.people.map((p) =>
+                p.id === personId ? { ...p, absences: [...(p.absences || []), newAbsence()] } : p
+              ),
+            }
+          : r
+      )
+    );
+  }
+
+  function updateAbsence(roomId, personId, absenceId, field, value) {
+    updateBill(
+      "rooms",
+      bill.rooms.map((r) =>
+        r.id === roomId
+          ? {
+              ...r,
+              people: r.people.map((p) =>
+                p.id === personId
+                  ? {
+                      ...p,
+                      absences: (p.absences || []).map((absence) =>
+                        absence.id === absenceId ? { ...absence, [field]: value } : absence
+                      ),
+                    }
+                  : p
+              ),
+            }
+          : r
+      )
+    );
+  }
+
+  function removeAbsence(roomId, personId, absenceId) {
+    updateBill(
+      "rooms",
+      bill.rooms.map((r) =>
+        r.id === roomId
+          ? {
+              ...r,
+              people: r.people.map((p) =>
+                p.id === personId
+                  ? { ...p, absences: (p.absences || []).filter((absence) => absence.id !== absenceId) }
+                  : p
+              ),
+            }
+          : r
+      )
+    );
+  }
+
   function addElectricityPeriod(roomId) {
     updateBill(
       "rooms",
       bill.rooms.map((r) =>
-        r.id === roomId ? { ...r, electricityPeriods: [...(r.electricityPeriods || []), newPeriod()] } : r
+        r.id === roomId
+          ? { ...r, electricityPeriods: [...(r.electricityPeriods || []), newPeriod(bill.startDate, bill.endDate)] }
+          : r
       )
     );
   }
@@ -303,7 +499,7 @@ export default function App() {
 
   async function copyResult() {
     const lines = [
-      `${bill.title}`,
+      `${billTitle}`,
       `Period: ${bill.startDate || "?"} to ${bill.endDate || "?"}`,
       `Electricity: ${currency(Number(bill.electricityTotal || 0))} / ${calculation.totalRoomDays} room-days = ${currency(calculation.electricityRate)} per room-day`,
       `Water: ${currency(Number(bill.waterTotal || 0))} / ${calculation.totalPersonDays} person-days = ${currency(calculation.waterRate)} per person-day`,
@@ -343,7 +539,7 @@ export default function App() {
               className={selectedBillId === b.id ? "month selected" : "month"}
               onClick={() => loadBill(b)}
             >
-              <strong>{b.title || "Monthly bill"}</strong>
+              <strong>{b.title || titleFromDates(b.startDate, b.endDate)}</strong>
               <span>{b.startDate || "?"} to {b.endDate || "?"}</span>
             </button>
           ))}
@@ -357,10 +553,10 @@ export default function App() {
             <div className="card span2">
               <h2>Monthly bill</h2>
               <div className="formgrid">
-                <label>Title<input value={bill.title || ""} onChange={(e) => updateBill("title", e.target.value)} /></label>
+                <label>Title<input className="readonly" value={billTitle} readOnly /></label>
                 <label>Shared other fee, optional<input type="number" value={bill.sharedOtherFee ?? 0} onChange={(e) => updateBill("sharedOtherFee", e.target.value)} /></label>
-                <label>Start date<input type="date" value={bill.startDate || ""} onChange={(e) => updateBill("startDate", e.target.value)} /></label>
-                <label>End date<input type="date" value={bill.endDate || ""} onChange={(e) => updateBill("endDate", e.target.value)} /></label>
+                <label>Start date<input type="date" value={bill.startDate || ""} onChange={(e) => updateBillPeriod("startDate", e.target.value)} /></label>
+                <label>End date<input type="date" value={bill.endDate || ""} onChange={(e) => updateBillPeriod("endDate", e.target.value)} /></label>
                 <label>Total electricity<input type="number" value={bill.electricityTotal ?? ""} onChange={(e) => updateBill("electricityTotal", e.target.value)} /></label>
                 <label>Total water<input type="number" value={bill.waterTotal ?? ""} onChange={(e) => updateBill("waterTotal", e.target.value)} /></label>
               </div>
@@ -416,6 +612,19 @@ export default function App() {
                         <label>End<input type="date" value={person.end || ""} onChange={(e) => updatePerson(room.id, person.id, "end", e.target.value)} /></label>
                         <button className="icon bottom" onClick={() => removePerson(room.id, person.id)}><Trash2 size={16} /></button>
                       </div>
+                      <div className="absence">
+                        <div className="subhead compact">
+                          <h3>Absent / travel dates</h3>
+                          <button onClick={() => addAbsence(room.id, person.id)}><Plus size={14} /> Add</button>
+                        </div>
+                        {(person.absences || []).map((absence) => (
+                          <div className="row3 absence-row" key={absence.id}>
+                            <label>Away start<input type="date" value={absence.start || ""} onChange={(e) => updateAbsence(room.id, person.id, absence.id, "start", e.target.value)} /></label>
+                            <label>Away end<input type="date" value={absence.end || ""} onChange={(e) => updateAbsence(room.id, person.id, absence.id, "end", e.target.value)} /></label>
+                            <button className="icon bottom" onClick={() => removeAbsence(room.id, person.id, absence.id)}><Trash2 size={16} /></button>
+                          </div>
+                        ))}
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -446,7 +655,10 @@ export default function App() {
                       <td><strong>{currency(room.total)}</strong></td>
                       <td>
                         {room.people.map((p) => (
-                          <div key={p.id}>{p.name || "Unnamed"}: {p.days} days → {currency(p.waterCost)}</div>
+                          <div key={p.id}>
+                            {p.name || "Unnamed"}: {p.days} days
+                            {p.absentDays > 0 ? ` (${p.occupiedDays} - ${p.absentDays} away)` : ""} → {currency(p.waterCost)}
+                          </div>
                         ))}
                       </td>
                     </tr>
@@ -456,7 +668,7 @@ export default function App() {
             </div>
             <p className="note">
               Dates are counted inclusively. For example, 4/5–4/29 = 25 days.
-              Electricity = total electricity ÷ room-use days. Water = total water ÷ person-days.
+              Electricity = total electricity ÷ room-use days. Water = total water ÷ person-days after away dates are subtracted.
             </p>
           </section>
         </section>
