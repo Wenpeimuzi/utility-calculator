@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { initializeApp } from "firebase/app";
 import {
   addDoc,
@@ -348,6 +348,7 @@ export default function App() {
   const [selectedBillId, setSelectedBillId] = useState(null);
   const [bill, setBill] = useState(exampleBill());
   const [status, setStatus] = useState("Not saved yet");
+  const loadedInitialBill = useRef(false);
 
   useEffect(() => {
     const billsRef = collection(db, "households", HOUSEHOLD_ID, "bills");
@@ -357,10 +358,11 @@ export default function App() {
         const rows = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
         rows.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
         setBills(rows);
-        if (!selectedBillId && rows.length > 0) {
+        if (!loadedInitialBill.current && !selectedBillId && rows.length > 0) {
           loadBill(rows[0]);
           setStatus("Loaded from Firebase");
         }
+        loadedInitialBill.current = true;
       },
       (error) => setStatus(`Firebase error: ${error.message}`)
     );
@@ -395,8 +397,8 @@ export default function App() {
     setBill(normalizeBill(b));
   }
 
-  async function saveBill() {
-    const data = {
+  function billData() {
+    return {
       ...bill,
       title: billTitle,
       electricityTotal: Number(bill.electricityTotal || 0),
@@ -404,6 +406,10 @@ export default function App() {
       sharedOtherFee: Number(bill.sharedOtherFee || 0),
       updatedAt: serverTimestamp(),
     };
+  }
+
+  async function saveBill() {
+    const data = billData();
 
     if (selectedBillId) {
       await setDoc(doc(db, "households", HOUSEHOLD_ID, "bills", selectedBillId), data, { merge: true });
@@ -416,6 +422,15 @@ export default function App() {
       setSelectedBillId(added.id);
       setStatus("Saved as a new month");
     }
+  }
+
+  async function saveAsNewBill() {
+    const added = await addDoc(collection(db, "households", HOUSEHOLD_ID, "bills"), {
+      ...billData(),
+      createdAt: serverTimestamp(),
+    });
+    setSelectedBillId(added.id);
+    setStatus("Saved as a new month");
   }
 
   async function deleteCurrentBill() {
@@ -597,7 +612,8 @@ export default function App() {
         <div className="actions">
           <button onClick={() => { setSelectedBillId(null); setBill(emptyBill()); }}>New month</button>
           <button onClick={() => { setSelectedBillId(null); setBill(exampleBill()); }}>Load example</button>
-          <button className="primary" onClick={saveBill}><Save size={16} /> Save</button>
+          <button className="primary" onClick={saveBill}><Save size={16} /> Save changes</button>
+          <button onClick={saveAsNewBill}><Plus size={16} /> Save as new month</button>
           <button onClick={copyResult}><Copy size={16} /> Copy result</button>
         </div>
       </header>
