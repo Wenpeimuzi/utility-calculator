@@ -181,6 +181,7 @@ const emptyBill = () => ({
   electricityTotal: "",
   waterTotal: "",
   sharedOtherFee: 0,
+  taxTotal: "",
   subsidyBaseTotal: "",
   subsidyPayableTotal: "",
   rooms: [newRoom("Room A"), newRoom("Room B"), newRoom("Room C")],
@@ -193,6 +194,7 @@ const exampleBill = () => ({
   electricityTotal: 159.41,
   waterTotal: 25.4,
   sharedOtherFee: 0,
+  taxTotal: "",
   subsidyBaseTotal: "",
   subsidyPayableTotal: "",
   rooms: [
@@ -236,6 +238,7 @@ function normalizeBill(raw) {
     electricityTotal: raw.electricityTotal ?? "",
     waterTotal: raw.waterTotal ?? "",
     sharedOtherFee: raw.sharedOtherFee ?? 0,
+    taxTotal: raw.taxTotal ?? "",
     subsidyBaseTotal: raw.subsidyBaseTotal ?? "",
     subsidyPayableTotal: raw.subsidyPayableTotal ?? "",
     rooms: (raw.rooms || []).map((room) => ({
@@ -327,14 +330,14 @@ function calculateBill(bill) {
   const waterRate = totalPersonDays > 0 ? Number(bill.waterTotal || 0) / totalPersonDays : 0;
   const sharedFeePerRoom = rooms.length > 0 ? Number(bill.sharedOtherFee || 0) / rooms.length : 0;
 
-  const rawRoomResults = rooms.map((room) => {
+  const subtotalRoomResults = rooms.map((room) => {
     const roomUse = roomUseRows.find((row) => row.roomId === room.id);
     const roomPeople = peopleRows.filter((p) => p.roomId === room.id);
     const electricityDays = roomUse?.electricityDays || 0;
     const electricity = electricityDays * electricityRate;
     const water = roomPeople.reduce((sum, p) => sum + p.days * waterRate, 0);
     const gasAdjustment = Number(room.gasAdjustment || 0);
-    const rawTotal = electricity + water + sharedFeePerRoom + gasAdjustment;
+    const subtotal = electricity + water + sharedFeePerRoom + gasAdjustment;
     return {
       ...room,
       electricityDays,
@@ -342,8 +345,19 @@ function calculateBill(bill) {
       water,
       sharedFee: sharedFeePerRoom,
       gasAdjustment,
-      rawTotal,
+      subtotal,
       people: roomPeople.map((p) => ({ ...p, waterCost: p.days * waterRate })),
+    };
+  });
+
+  const taxTotal = Number(bill.taxTotal || 0);
+  const taxBaseTotal = subtotalRoomResults.reduce((sum, room) => sum + Math.max(0, room.subtotal), 0);
+  const rawRoomResults = subtotalRoomResults.map((room) => {
+    const tax = taxBaseTotal > 0 ? taxTotal * (Math.max(0, room.subtotal) / taxBaseTotal) : 0;
+    return {
+      ...room,
+      tax,
+      rawTotal: room.subtotal + tax,
     };
   });
 
@@ -437,6 +451,7 @@ export default function App() {
       electricityTotal: Number(bill.electricityTotal || 0),
       waterTotal: Number(bill.waterTotal || 0),
       sharedOtherFee: Number(bill.sharedOtherFee || 0),
+      taxTotal: bill.taxTotal === "" ? "" : Number(bill.taxTotal || 0),
       subsidyBaseTotal: bill.subsidyBaseTotal === "" ? "" : Number(bill.subsidyBaseTotal || 0),
       subsidyPayableTotal: bill.subsidyPayableTotal === "" ? "" : Number(bill.subsidyPayableTotal || 0),
       updatedAt: serverTimestamp(),
@@ -626,6 +641,7 @@ export default function App() {
       `Period: ${bill.startDate || "?"} to ${bill.endDate || "?"}`,
       `Electricity: ${currency(Number(bill.electricityTotal || 0))} / ${calculation.totalRoomDays} occupied room-days = ${currency(calculation.electricityRate)} per room-day`,
       `Water: ${currency(Number(bill.waterTotal || 0))} / ${calculation.totalPersonDays} person-days = ${currency(calculation.waterRate)} per person-day`,
+      `Tax/GST: ${currency(Number(bill.taxTotal || 0))} split by each room's pre-tax share`,
       ...(calculation.subsidyApplied
         ? [
             `Subsidy ratio: ${currency(calculation.subsidyPayableTotal)} / ${currency(calculation.subsidyBaseTotal)} = ${(calculation.subsidyRatio * 100).toFixed(2)}%`,
@@ -634,7 +650,7 @@ export default function App() {
       "",
       ...calculation.roomResults.map(
         (r) =>
-          `${r.name}: ${currency(r.total)} due${calculation.subsidyApplied ? ` from ${currency(r.rawTotal)} before subsidy` : ""}  electricity ${currency(r.electricity)} + water ${currency(r.water)} + gas/adjustment ${currency(r.gasAdjustment)}`
+          `${r.name}: ${currency(r.total)} due${calculation.subsidyApplied ? ` from ${currency(r.rawTotal)} before subsidy` : ""}  electricity ${currency(r.electricity)} + water ${currency(r.water)} + shared ${currency(r.sharedFee)} + gas/adjustment ${currency(r.gasAdjustment)} + tax/GST ${currency(r.tax)}`
       ),
     ];
     await navigator.clipboard.writeText(lines.join("\n"));
@@ -688,6 +704,7 @@ export default function App() {
                 <label>End date<input type="date" value={bill.endDate || ""} onChange={(e) => updateBillPeriod("endDate", e.target.value)} /></label>
                 <label>Total electricity<input type="number" value={bill.electricityTotal ?? ""} onChange={(e) => updateBill("electricityTotal", e.target.value)} /></label>
                 <label>Total water<input type="number" value={bill.waterTotal ?? ""} onChange={(e) => updateBill("waterTotal", e.target.value)} /></label>
+                <label>GST / tax total, optional<input type="number" value={bill.taxTotal ?? ""} onChange={(e) => updateBill("taxTotal", e.target.value)} /></label>
                 <label>Original total before subsidy, optional<input type="number" value={bill.subsidyBaseTotal ?? ""} onChange={(e) => updateBill("subsidyBaseTotal", e.target.value)} /></label>
                 <label>Actual amount to split after subsidy, optional<input type="number" value={bill.subsidyPayableTotal ?? ""} onChange={(e) => updateBill("subsidyPayableTotal", e.target.value)} /></label>
               </div>
@@ -778,7 +795,7 @@ export default function App() {
               <table>
                 <thead>
                   <tr>
-                    <th>Room</th><th>Electricity days</th><th>Electricity</th><th>Water</th><th>Shared fee</th><th>Extra / credit</th><th>Before subsidy</th><th>Total due</th><th>Person-day detail</th>
+                    <th>Room</th><th>Electricity days</th><th>Electricity</th><th>Water</th><th>Shared fee</th><th>Extra / credit</th><th>GST / tax</th><th>Before subsidy</th><th>Total due</th><th>Person-day detail</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -790,6 +807,7 @@ export default function App() {
                       <td>{currency(room.water)}</td>
                       <td>{currency(room.sharedFee)}</td>
                       <td>{currency(room.gasAdjustment)}</td>
+                      <td>{currency(room.tax)}</td>
                       <td>{currency(room.rawTotal)}</td>
                       <td><strong>{currency(room.total)}</strong></td>
                       <td>
@@ -807,7 +825,7 @@ export default function App() {
             </div>
             <p className="note">
               Dates are counted inclusively. For example, 4/5–4/29 = 25 days.
-              Electricity = total electricity ÷ occupied room-days. A room-day counts once if at least one person is present in that room after away dates are subtracted. Water = total water ÷ person-days after away dates are subtracted. If subsidy is entered, total due = before-subsidy total × actual amount to split ÷ original total before subsidy.
+              Electricity = total electricity ÷ occupied room-days. A room-day counts once if at least one person is present in that room after away dates are subtracted. Water = total water ÷ person-days after away dates are subtracted. GST / tax is split by each room's pre-tax share. If subsidy is entered, total due = before-subsidy total × actual amount to split ÷ original total before subsidy.
             </p>
           </section>
         </section>
